@@ -30,12 +30,25 @@ docker compose exec -T backend python -m scripts.seed_demo
 | 组件 | 技术与职责 |
 |---|---|
 | frontend | 原生 HTML / CSS / JS ES Modules，Nginx代理 `/api/` |
-| backend | Python3.11 / FastAPI / SQLAlchemy / JWT |
-| worker | 独立Python进程，Redis BLPOP队列，持久化结果/CSV/心跳 |
+| backend | Python3.11 / FastAPI / SQLAlchemy / JWT，内置对账守护线程 |
+| worker | 独立Python进程（可多副本），Redis BLPOP队列，租约/心跳/fencing/工件核对 |
 | db | PostgreSQL16，命名卷持久化 |
 | redis | Redis7，AOF命名卷 |
 
-恰好五服务，均配置healthcheck；后端/worker依赖数据库与Redis健康，前端依赖后端健康；worker与后端共享 `artifacts` 命名卷。重置演示环境：`docker compose down -v --remove-orphans`，会删除本项目卷。
+恰好五服务，均配置healthcheck；后端/worker依赖数据库与Redis健康，前端依赖后端健康；worker与后端共享 `artifacts` 命名卷。worker 副本数由 `WORKER_REPLICAS`（默认2）控制。重置演示环境：`docker compose down -v --remove-orphans`，会删除本项目卷。
+
+### 计算可靠性（崩溃、断连、重复消息）
+
+研究从入库到开放采用全程可恢复，复访人员可据页面字段判断结果能否采用：
+
+- **同一请求重试不新增研究**：前端每次提交生成 `Idempotency-Key`，后端对该键建唯一索引；网络重试、重复点击、并发提交都返回同一条 `density_runs`。
+- **队列短断自动补送**：入队带退避重试；Redis 暂时不可用时任务保留 `queued`，后端对账线程每 10 秒扫描超时未投递的任务并补推（先确认队列中无该消息，不重复推送）。
+- **进程崩溃后恢复且沿用冻结输入**：worker 每 2 秒写心跳，运行超过 60 秒无心跳即判定崩溃，对账线程把任务接回 `queued` 并递增 `takeovers`，重新计算只读取创建时冻结的 `snapshot`，不读取来源当前数据。
+- **多进程并发仅一份有效执行**：领取与终态写回都用条件 UPDATE（compare-and-set）做状态守卫，PG 行锁 / SQLite 写锁串行化；每次领取递增 `attempt_id` 作为 fencing token。
+- **超时接管后晚归无权改写**：原进程的写回带 `WHERE state='running' AND attempt_id=<自己的代次>`，被接管后代次失效，rowcount=0，晚归的成功或失败结果一律丢弃。
+- **核对一致才开放采用**：结果先写临时文件、fsync、原子 rename 为正式 CSV，再把完整 CSV 逐行逐列与数据库结果双向核对并记录双 SHA256，通过后置 `completed` + `verified_at`；未核对任务不能导出、不能据此提交复访计划。工件丢失/损坏时从已核对结果自动重建并重新验证。
+- **重复消息只留一次完成审计**：`audit_events.event_key` 唯一索引保证同一任务的 `run.completed` 等终态事件只有一条；终态任务收到重复队列消息直接忽略。
+- **页面可见**：结果页与任务台账展示队列等待时长、执行/接管次数、最近心跳、核对结论与最终状态。已批准复访计划保存独立结果快照，原任务后续变化不影响已批准内容。
 
 ## 账号与权限
 
@@ -100,9 +113,10 @@ backend/migrations/001_initial.sql
 | FRONTEND_PORT / BACKEND_PORT / DB_PORT | `18246 / 19246 / 17746` |
 | SEED_DEMO | `true` |
 | JWT_SECRET | `.env.example`演示值，部署前修改 |
+| WORKER_REPLICAS | `2`，worker 副本数，并发领取由数据库守卫保证仅一份有效执行 |
 | DATABASE_URL / REDIS_URL | Compose内部连接，定义在compose的env锚点 |
 | ARTIFACT_DIR | `/artifacts`，后端worker共享 |
 
 共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/completed/failed、draft/approved。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business跨总览、结果、配置与复核复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
 
-测试及截图在批根 `test-artifacts/gb-0042/`，不混入源码。独立算法oracle、HTTP完整流程和真实Playwright浏览器流程见该目录 `TESTING.md`。License：MIT。
+测试及截图在批根 `test-artifacts/gb-0042/`，不混入源码。独立算法oracle、HTTP完整流程和真实Playwright浏览器流程见该目录 `TESTING.md`。可靠性场景测试在 `backend/tests/`（SQLite + fakeredis 即可离线运行）：`python tests/test_reliability.py` 覆盖幂等建研究、断连补送、崩溃接管沿用冻结输入、并发领取、fencing 晚归拦截、工件核对、中断恢复、审计幂等与已批准快照留存；`python tests/test_http_flow.py` 覆盖完整 HTTP 链路。License：MIT。

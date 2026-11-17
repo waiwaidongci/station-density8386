@@ -1,4 +1,4 @@
-from fastapi import APIRouter,Depends
+from fastapi import APIRouter,Depends,Header
 from ..config.database import db_session
 from ..schemas.run import RunInput
 from ..services.auth import current_user,writer
@@ -7,8 +7,10 @@ from ..controllers.runs import RunsController as C
 router=APIRouter()
 @router.get('/runs')
 def runs(db=Depends(db_session),u=Depends(current_user)):return C.list(db)
-@router.post('/runs')
-def create(data:RunInput,db=Depends(db_session),u=Depends(writer)):return C.create(db,u,data)
+@router.post('/runs',status_code=201)
+def create(data:RunInput,db=Depends(db_session),u=Depends(writer),
+           idempotency_key:str|None=Header(default=None,alias='Idempotency-Key',max_length=80)):
+    return C.create(db,u,data,idempotency_key)
 @router.get('/runs/{id}')
 def detail(id:int,db=Depends(db_session),u=Depends(current_user)):return C.get(db,id)
 @router.get('/runs/{id}/export')

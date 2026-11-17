@@ -9,7 +9,7 @@ from src.models.run import Run
 from src.models import note,audit
 from src.utils.security import hash_password
 from src.utils.serialization import now
-from src.services.runs import queue
+from src.services.dispatch import enqueue_run
 from src.services.domain_validation import validate_record
 
 def seed_values(kind,index,batch,rng):
@@ -51,9 +51,8 @@ def seed():
             db.flush()
             if batch==0 and not db.scalar(select(Run.id).where(Run.name=='首轮种子研究')):
                 records=[{'id':r.id,'source_id':r.source_id,'reference':r.reference,'values':r.values} for r in db.scalars(select(Record).where(Record.source_id==source.id).order_by(Record.id))]
-                run=Run(source_id=source.id,name='首轮种子研究',state='queued',parameters=CONFIG['default_parameters'],snapshot={'source':{'id':source.id,'name':source.name,'filename':source.filename},'records':records},created_at=now());db.add(run);db.flush();queued.append(run.id)
+                run=Run(source_id=source.id,name='首轮种子研究',state='queued',parameters=CONFIG['default_parameters'],snapshot={'source':{'id':source.id,'name':source.name,'filename':source.filename},'records':records},created_at=now(),enqueued_at=now());db.add(run);db.flush();queued.append(run.id)
         db.commit();print(json.dumps(counts(db),ensure_ascii=False))
     for id in queued:
-        try:queue.rpush('analysis:queue',id)
-        except Exception:logging.exception('seed queue unavailable')
+        if not enqueue_run(id):logging.exception('seed enqueue unavailable; reconciler will retry')
 if __name__=='__main__':seed()

@@ -49,10 +49,13 @@ services:
       start_period: 15s
   worker:
     build: ./backend
-    container_name: ${COMPOSE_PROJECT_NAME:-station-density}-worker
     command: ["python", "-m", "src.worker"]
     environment: *env
     volumes: ["artifacts:/artifacts"]
+    # 多进程并发领取同一任务时，数据库行锁+状态+fencing token 保证仅一份有效执行。
+    # 调整 WORKER_REPLICAS 即可扩缩；不设 container_name 以支持副本。
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
     depends_on:
       db: {condition: service_healthy}
       redis: {condition: service_healthy}

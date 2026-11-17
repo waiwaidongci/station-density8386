@@ -1,34 +1,35 @@
-import json,time,logging
-from redis import Redis
-from sqlalchemy import select
-from .config.database import Session
-from .config.settings import REDIS_URL,ARTIFACT_DIR
-from .models.run import Run
-from .models import source,record,user,note,audit
-from .services.algorithm import calculate
-from .services.audit import log
-from .services.export import csv_response
-queue=Redis.from_url(REDIS_URL)
+"""独立计算进程：BLPOP 消费队列，执行前后均有数据库状态守卫。
+
+- 多进程部署时同一 run_id 即便被重复投递，claim_run 的行锁+状态守卫也只放行一份执行。
+- 启动即跑一轮 reconcile：上次进程崩溃留下的 running 租约超时后自动接管，沿用冻结输入。
+- 心跳文件供容器健康检查；心跳写库供超时接管判断。
+"""
+import time,logging,uuid
+from .config.database import Base,engine
+from .config.migrate import run_migrations
+from .config.settings import ARTIFACT_DIR
+from .services.dispatch import queue,QUEUE_KEY,execute_run,reconcile_once
+
+WORKER_ID=uuid.uuid4().hex[:12]
 ARTIFACT_DIR.mkdir(parents=True,exist_ok=True)
-def execute(id):
-    with Session() as db:
-        r=db.get(Run,id)
-        if not r or r.state!='queued':return
-        r.state='running';db.commit()
-        try:
-            result=calculate(r.snapshot['records'],r.parameters)
-            json.dumps(result,allow_nan=False)
-            r.result=result;r.state='completed'
-            response=csv_response(result,'run.csv')
-            (ARTIFACT_DIR/f'run-{r.id}.csv').write_bytes(response.body)
-            log(db,'worker','run.completed',r.id)
-        except Exception as e:
-            logging.exception('analysis failed');r.state='failed';r.error=str(e)[:2000]
-            log(db,'worker','run.failed',r.id,r.error)
-        db.commit()
+
 def main():
+    logging.basicConfig(level=logging.INFO,
+                        format='%%(asctime)s worker %s %%(levelname)s %%(message)s'%WORKER_ID)
+    Base.metadata.create_all(engine)
+    run_migrations()
+    reconcile_once()  # 崩溃恢复：接管僵死租约、补送漏单
+    logging.info('worker %s ready',WORKER_ID)
     while True:
         (ARTIFACT_DIR/'heartbeat').write_text(str(time.time()))
-        value=queue.blpop('analysis:queue',timeout=2)
-        if value:execute(int(value[1]))
+        try:
+            value=queue.blpop(QUEUE_KEY,timeout=2)
+        except Exception:
+            logging.exception('queue read error; retry after backoff')
+            time.sleep(1)
+            continue
+        if value:
+            try:execute_run(int(value[1]),WORKER_ID)
+            except Exception:logging.exception('execute crashed for message %r',value[1])
+
 if __name__=='__main__':main()
